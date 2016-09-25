@@ -13,6 +13,7 @@ var filed = require('filed');
 var plugins = require('restify-plugins');
 var restifyClients = require('restify-clients');
 var uuid = require('node-uuid');
+var validator = require('validator');
 
 var RestError = errors.RestError;
 var restify = require('../lib');
@@ -43,7 +44,8 @@ before(function (cb) {
             dtrace: helper.dtrace,
             handleUncaughtExceptions: true,
             log: helper.getLog('server'),
-            version: ['2.0.0', '0.5.4', '1.4.3']
+            version: ['2.0.0', '0.5.4', '1.4.3'],
+            reqIdHeaders: ['x-req-id-a', 'x-req-id-b']
         });
         SERVER.listen(PORT, '127.0.0.1', function () {
             PORT = SERVER.address().port;
@@ -940,12 +942,18 @@ test('gh-278 missing router error events (415)', function (t) {
 
 
 test('next.ifError', function (t) {
-    SERVER.use(function (req, res, next) {
+
+    var port = 3000;
+    var myServer = restify.createServer({
+        handleUncaughtExceptions: true
+    });
+
+    myServer.use(function (req, res, next) {
         next.ifError(null);
         next();
     });
 
-    SERVER.get('/foo/:id', function tester(req, res, next) {
+    myServer.get('/foo/:id', function tester(req, res, next) {
         process.nextTick(function () {
             var e = new RestError({
                 statusCode: 400,
@@ -959,10 +967,53 @@ test('next.ifError', function (t) {
         });
     });
 
-    CLIENT.get('/foo/bar', function (err) {
-        t.ok(err);
-        t.equal(err.body.message, 'screw you client');
+    myServer.listen(port, function () {
+        var myClient = restifyClients.createJsonClient({
+            url: 'http://127.0.0.1:' + port,
+            headers: {
+                connection: 'close'
+            }
+        });
+
+        myClient.get('/foo/bar', function (err) {
+            t.ok(err);
+            t.equal(err.message, '');
+            myServer.close(function () {
+                t.end();
+            });
+        });
+    });
+});
+
+
+test('next.ifError is not available by default', function (t) {
+
+    var port = 3000;
+    var myServer = restify.createServer();
+
+    myServer.get('/', function (req, res, next) {
+        t.throws(function () {
+            next.ifError(new Error('boom'));
+        }, 'TypeError', 'next.ifError is not a function');
+
+        res.send('hi');
         t.end();
+    });
+
+    myServer.listen(port, function () {
+        var myClient = restifyClients.createStringClient({
+            url: 'http://127.0.0.1:' + port,
+            headers: {
+                connection: 'close'
+            }
+        });
+
+        myClient.get('/', function (err) {
+            t.ifError(err);
+            myServer.close(function () {
+                t.end();
+            });
+        });
     });
 });
 
@@ -2124,26 +2175,6 @@ test('GH-999 Custom 404 handler does not send response', function (t) {
 });
 
 
-test('GH-1084 missing toString() causes formatter to error', function (t) {
-
-    SERVER.get('/foo', function (req, res, next) {
-        res.header('content-type', 'text/plain');
-        var obj = {
-            message: 'foo',
-            toString: null
-        };
-        res.send(200, obj);
-        return next();
-    });
-
-    CLIENT.get('/foo', function (err, req, res, body) {
-        t.ok(err);
-        t.equal(err.message, '');
-        t.end();
-    });
-});
-
-
 test('calling next(false) should early exit from pre handlers', function (t) {
 
     var afterFired = false;
@@ -2170,4 +2201,190 @@ test('calling next(false) should early exit from pre handlers', function (t) {
         t.end();
     });
 
+});
+
+
+test('GH-1086: should reuse request id when available', function (t) {
+
+    SERVER.get('/1', function (req, res, next) {
+        // the 12345 value is set when the client is created.
+        t.ok(req.headers.hasOwnProperty('x-req-id-a'));
+        t.equal(req.getId(), req.headers['x-req-id-a']);
+        res.send('hello world');
+        return next();
+    });
+
+    // create new client since we new specific headers
+    CLIENT = restifyClients.createJsonClient({
+        url: 'http://127.0.0.1:' + PORT,
+        headers:{
+            'x-req-id-a': 12345
+        }
+    });
+
+    CLIENT.get('/1', function (err, req, res, data) {
+        t.ifError(err);
+        t.equal(data, 'hello world');
+        t.end();
+    });
+});
+
+
+test('GH-1086: should use second request id when available', function (t) {
+
+    SERVER.get('/1', function (req, res, next) {
+        t.ok(req.headers.hasOwnProperty('x-req-id-b'));
+        t.equal(req.getId(), req.headers['x-req-id-b']);
+        res.send('hello world');
+        return next();
+    });
+
+    // create new client since we new specific headers
+    CLIENT = restifyClients.createJsonClient({
+        url: 'http://127.0.0.1:' + PORT,
+        headers:{
+            'x-req-id-b': 678910
+        }
+    });
+
+    CLIENT.get('/1', function (err, req, res, data) {
+        t.ifError(err);
+        t.equal(data, 'hello world');
+        t.end();
+    });
+});
+
+
+test('GH-1086: should use default uuid request id if none provided',
+function (t) {
+
+    SERVER.get('/1', function (req, res, next) {
+        t.ok(req.getId());
+        t.ok(validator.isUUID(req.getId()));
+        res.send('hello world');
+        return next();
+    });
+
+    // create new client since we new specific headers
+    CLIENT = restifyClients.createJsonClient({
+        url: 'http://127.0.0.1:' + PORT
+    });
+
+    CLIENT.get('/1', function (err, req, res, data) {
+        t.ifError(err);
+        t.equal(data, 'hello world');
+        t.end();
+    });
+});
+
+
+test('GH-1086: empty request id should be ignored', function (t) {
+
+    SERVER.get('/1', function (req, res, next) {
+        t.ok(req.headers.hasOwnProperty('x-req-id-b'));
+        t.equal(req.getId(), req.headers['x-req-id-b']);
+        res.send('hello world');
+        return next();
+    });
+
+    // create new client since we new specific headers
+    CLIENT = restifyClients.createJsonClient({
+        url: 'http://127.0.0.1:' + PORT,
+        headers:{
+            'x-req-id-a': '',
+            'x-req-id-b': 12345
+        }
+    });
+
+    CLIENT.get('/1', function (err, req, res, data) {
+        t.ifError(err);
+        t.equal(data, 'hello world');
+        t.end();
+    });
+});
+
+
+test('GH-1078: server name should default to restify', function (t) {
+
+    var myServer = restify.createServer();
+    var port = 3000;
+
+    myServer.get('/', function (req, res, next) {
+        res.send('hi');
+        return next();
+    });
+
+    var myClient = restifyClients.createStringClient({
+        url: 'http://127.0.0.1:' + port,
+        headers: {
+            connection: 'close'
+        }
+    });
+
+    myServer.listen(port, function () {
+        myClient.get('/', function (err, req, res, data) {
+            t.ifError(err);
+            t.equal(res.headers.server, 'restify');
+            myServer.close(t.end);
+        });
+    });
+});
+
+
+test('GH-1078: server name should be customizable', function (t) {
+
+    var myServer = restify.createServer({
+        name: 'foo'
+    });
+    var port = 3000;
+
+    myServer.get('/', function (req, res, next) {
+        res.send('hi');
+        return next();
+    });
+
+    var myClient = restifyClients.createStringClient({
+        url: 'http://127.0.0.1:' + port,
+        headers: {
+            connection: 'close'
+        }
+    });
+
+    myServer.listen(port, function () {
+        myClient.get('/', function (err, req, res, data) {
+            t.ifError(err);
+            t.equal(res.headers.server, 'foo');
+            myServer.close(t.end);
+        });
+    });
+});
+
+
+test('GH-1078: server name should be overridable and not sent down',
+function (t) {
+
+    var myServer = restify.createServer({
+        name: ''
+    });
+    var port = 3000;
+
+    myServer.get('/', function (req, res, next) {
+        res.send('hi');
+        return next();
+    });
+
+    var myClient = restifyClients.createStringClient({
+        url: 'http://127.0.0.1:' + port,
+        headers: {
+            connection: 'close'
+        }
+    });
+
+    myServer.listen(port, function () {
+        myClient.get('/', function (err, req, res, data) {
+            t.ifError(err);
+            t.equal(res.headers.hasOwnProperty('server'), false);
+            myServer.close(t.end);
+        });
+    });
 });
